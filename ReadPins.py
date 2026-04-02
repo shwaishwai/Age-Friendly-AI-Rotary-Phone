@@ -3,7 +3,7 @@ import time
 import signal
 import sys
 
-pulse_input = Button(17, pull_up=False)
+pulse_input = Button(27, pull_up=False) # name for GPIO pin
 
 count = 0
 last_pulse_time = time.time()
