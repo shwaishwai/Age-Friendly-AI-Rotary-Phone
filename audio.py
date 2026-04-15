@@ -3,6 +3,7 @@ import numpy as np
 import scipy.io.wavfile as wav
 import sounddevice as sd
 import whisper
+from gtts import gTTS
 
 SAMPLE_RATE = 16000
 RECORDING_DURATION = 5  # seconds per recording chunk
@@ -41,6 +42,8 @@ def transcribe(filename: str = "temp.wav") -> str:
 
 
 def speak(text: str, voice: str = "en"):
-    """TTS via espeak. Swap for piper/mimic for better quality."""
-    safe = text.replace('"', '\\"')
-    os.system(f'espeak -v {voice} "{safe}"')
+    """TTS via gTTS — much more natural than espeak."""
+    print(f"  [tts] {text}")
+    tts = gTTS(text=text, lang="en", tld="com.au")
+    tts.save("speech.mp3")
+    os.system("mpg123 speech.mp3")

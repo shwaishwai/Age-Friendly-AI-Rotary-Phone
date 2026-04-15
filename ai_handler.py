@@ -1,3 +1,4 @@
+import threading
 from openai import OpenAI
 from base import BaseHandler
 import sys, os
@@ -16,18 +17,23 @@ class AIHandler(BaseHandler):
         self.system_prompt = config.get(
             "system_prompt", "You are a helpful assistant. Keep responses brief."
         )
-        self.model = config.get("model", "gpt-3.5-turbo")
+        self.model  = config.get("model", "gpt-3.5-turbo")
         self.client = OpenAI()  # reads OPENAI_API_KEY from env
 
-    def run(self):
+    def run(self, hangup_event: threading.Event):
         print(f"\n  [call] Connected to '{self.name}'")
-        speak(f"You are connected to {self.name}.", voice=self.voice)
+        speak(f"You are connected to {self.name}.")
 
         messages = []
 
-        while True:
+        while not hangup_event.is_set():
             try:
                 audio = record_audio()
+
+                # Check again after the blocking record — user may have hung up
+                if hangup_event.is_set():
+                    break
+
                 save_audio(audio)
 
                 print("  [stt] Transcribing...")
@@ -50,12 +56,14 @@ class AIHandler(BaseHandler):
                 print(f"  [{self.name}] {reply_text}")
                 messages.append({"role": "assistant", "content": reply_text})
 
-                speak(reply_text, voice=self.voice)
+                # Only speak if still on the call
+                if not hangup_event.is_set():
+                    speak(reply_text)
 
-            except KeyboardInterrupt:
-                print("  [call] Caller hung up.")
-                break
             except Exception as e:
                 print(f"  [error] {e}")
-                speak("Sorry, there was a problem. Please try again.", voice=self.voice)
+                if not hangup_event.is_set():
+                    speak("Sorry, there was a problem. Please try again.")
                 break
+
+        print(f"  [call] '{self.name}' call ended.")

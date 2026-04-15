@@ -1,12 +1,12 @@
 import sys
 import os
+import threading
 sys.path.insert(0, os.path.dirname(__file__))
 from ai_handler import AIHandler
 from info_handler import InfoHandler
 from base import BaseHandler
 
 
-# Map "type" values in lines.json to handler classes
 _HANDLER_CLASSES: dict[str, type[BaseHandler]] = {
     "ai":   AIHandler,
     "info": InfoHandler,
@@ -19,7 +19,7 @@ class Router:
     To support a new line type, add it to _HANDLER_CLASSES above.
     """
 
-    def dispatch(self, number: str, lines: dict):
+    def dispatch(self, number: str, lines: dict, hangup_event: threading.Event):
         config = lines.get(number)
 
         if config is None:
@@ -39,4 +39,4 @@ class Router:
 
         handler = handler_class(config)
         print(f"  [router] -> {handler}")
-        handler.run()
+        handler.run(hangup_event)
