@@ -27,7 +27,8 @@ class Switchboard:
 
         self.state        = IDLE
         self.off_hook     = False
-        self.hangup_event = threading.Event()  # set when handset is replaced mid-call
+        self.hangup_event = threading.Event()
+        self._hangup_timer = None             # debounce timer for on-hook
 
         self.pulse_count     = 0
         self.last_pulse_time = time.time()
@@ -67,17 +68,26 @@ class Switchboard:
     # ------------------------------------------------------------------
 
     def _on_off_hook(self):
-        """Handset lifted — ready to dial."""
+        """Handset lifted - cancel any pending hangup and mark as off hook."""
+        if self._hangup_timer is not None:
+            self._hangup_timer.cancel()
+            self._hangup_timer = None
         self.off_hook = True
         self.hangup_event.clear()
         print("[hook] Off hook - ready to dial")
 
     def _on_on_hook(self):
-        """Handset replaced — terminate whatever is happening."""
-        self.off_hook = False
-        self.hangup_event.set()   # signals any blocking handler to stop
-        print("[hook] On hook - terminating call")
-        self._reset()
+        """Handset replaced - wait 100ms before committing the hangup."""
+        def _commit_hangup():
+            self.off_hook = False
+            self.hangup_event.set()
+            print("[hook] On hook - terminating call")
+            self._reset()
+
+        if self._hangup_timer is not None:
+            self._hangup_timer.cancel()
+        self._hangup_timer = threading.Timer(0.1, _commit_hangup)
+        self._hangup_timer.start()
 
     # ------------------------------------------------------------------
     # Pulse callback (fires on GPIO background thread)
@@ -143,6 +153,8 @@ class Switchboard:
 
     def _cleanup(self, sig=None, frame=None):
         print("\n[switchboard] Shutting down...")
+        if self._hangup_timer is not None:
+            self._hangup_timer.cancel()
         self.pulse_gpio.close()
         self.hook_gpio.close()
         sys.exit(0)
