@@ -1,42 +1,26 @@
-import sys
-import os
-import threading
-sys.path.insert(0, os.path.dirname(__file__))
 from ai_handler import AIHandler
 from info_handler import InfoHandler
-from base import BaseHandler
-
-
-_HANDLER_CLASSES: dict[str, type[BaseHandler]] = {
-    "ai":   AIHandler,
-    "info": InfoHandler,
-}
 
 
 class Router:
-    """
-    Builds a handler from a line config and calls run() on it.
-    To support a new line type, add it to _HANDLER_CLASSES above.
-    """
+    def __init__(self, lines: dict):
+        self.lines = lines
 
-    def dispatch(self, number: str, lines: dict, hangup_event: threading.Event):
-        config = lines.get(number)
+    def connect(self, number: str, hangup_event):
+        config = self.lines.get(number)
 
         if config is None:
-            print(f"  [router] No line configured for '{number}'")
-            from audio import speak
-            speak("Number not recognised. Please try again.")
+            print(f"  [router] No line configured for number {number}")
             return
 
-        line_type = config.get("type", "ai")
-        handler_class = _HANDLER_CLASSES.get(line_type)
+        line_type = config.get("type")
 
-        if handler_class is None:
-            print(f"  [router] Unknown line type '{line_type}'")
-            from audio import speak
-            speak(f"Line type {line_type} is not supported.")
+        if line_type == "ai":
+            handler = AIHandler(config)
+        elif line_type == "info":
+            handler = InfoHandler(config)
+        else:
+            print(f"  [router] Unknown line type: {line_type!r}")
             return
 
-        handler = handler_class(config)
-        print(f"  [router] -> {handler}")
         handler.run(hangup_event)

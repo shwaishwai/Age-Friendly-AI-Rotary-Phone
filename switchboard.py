@@ -1,163 +1,220 @@
-import time
-import signal
-import sys
 import json
 import threading
+import time
+from pathlib import Path
+
 from gpiozero import Button
-import os
-sys.path.insert(0, os.path.dirname(__file__))
+
 from router import Router
 
-GPIO_PIN_PULSE = 27
-GPIO_PIN_HOOK  = 22
 
-GAP_TIMEOUT    = 0.3   # seconds between pulses to end a digit
-NUMBER_TIMEOUT = 3.0   # seconds of silence after last digit to commit number
+# Correct pins for your current wiring
+PULSE_PIN = 27
+HOOK_PIN = 22
 
-IDLE       = "IDLE"
-DIALING    = "DIALING"
-PROCESSING = "PROCESSING"
-IN_CALL    = "IN_CALL"
+# Current hook logic:
+# HIGH = off-hook / handset lifted
+# LOW  = on-hook / handset down
+HOOK_ACTIVE_HIGH = True
+
+# Rotary dial pulse settings
+PULSE_EDGE = "pressed"       # change to "released" if pulse_test.py shows that is better
+PULSE_BOUNCE_SECONDS = 0.003
+
+# Time after last pulse before the digit is considered complete
+DIGIT_GAP_SECONDS = 1.00
+
+# Your hook line drops briefly while dialling, so do not reset immediately.
+# It must stay on-hook this long before we reset.
+HOOK_HANGUP_CONFIRM_SECONDS = 0.60
 
 
 class Switchboard:
-    def __init__(self, lines_path: str = "lines.json"):
+    def __init__(self, lines_path="lines.json"):
         self.lines = self._load_lines(lines_path)
-        self.router = Router()
+        self.router = Router(self.lines)
 
-        self.state        = IDLE
-        self.off_hook     = False
+        self.state = "ON_HOOK"
+        self.number = ""
+        self.pulse_count = 0
+        self.last_pulse_at = None
+
         self.hangup_event = threading.Event()
-        self._hangup_timer = None             # debounce timer for on-hook
+        self.call_thread = None
+        self.hook_check_active = False
 
-        self.pulse_count     = 0
-        self.last_pulse_time = time.time()
-        self.dialled_number  = ""
-        self.last_digit_time = time.time()
+        # Hook: HIGH = off-hook, LOW = on-hook
+        self.hook = Button(
+            HOOK_PIN,
+            pull_up=False,
+            bounce_time=0.03,
+        )
 
-        # Rotary dial pulse input
-        self.pulse_gpio = Button(GPIO_PIN_PULSE, pull_up=False)
-        self.pulse_gpio.when_pressed = self._on_pulse
+        # Pulse: impulse contacts between GPIO 27 and GND
+        self.pulse = Button(
+            PULSE_PIN,
+            pull_up=True,
+            bounce_time=PULSE_BOUNCE_SECONDS,
+        )
 
-        # Hook switch: pressed = handset lifted, released = handset replaced
-        self.hook_gpio = Button(GPIO_PIN_HOOK, pull_up=False)
-        self.hook_gpio.when_pressed  = self._on_off_hook
-        self.hook_gpio.when_released = self._on_on_hook
+        self.hook.when_pressed = self._handset_lifted
+        self.hook.when_released = self._possible_handset_down
 
-        signal.signal(signal.SIGINT, self._cleanup)
-        signal.signal(signal.SIGTERM, self._cleanup)
+        if PULSE_EDGE == "pressed":
+            self.pulse.when_pressed = self._pulse_event
+        elif PULSE_EDGE == "released":
+            self.pulse.when_released = self._pulse_event
+        else:
+            raise ValueError('PULSE_EDGE must be "pressed" or "released"')
 
-        self._print_directory()
+        # Start in the actual physical state
+        if self.hook.is_pressed:
+            self._handset_lifted()
+        else:
+            self._handset_down_confirmed()
 
-    # ------------------------------------------------------------------
-    # Setup
-    # ------------------------------------------------------------------
-
-    def _load_lines(self, path: str) -> dict:
-        with open(path) as f:
+    def _load_lines(self, path):
+        p = Path(path)
+        with p.open("r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _print_directory(self):
-        print(f"Switchboard ready. {len(self.lines)} line(s) loaded:")
-        for num, cfg in self.lines.items():
-            print(f"  Dial {num}  ->  {cfg.get('name', '?')}  -  {cfg.get('description', '')}")
-        print("\nWaiting for handset to be lifted...\n")
+    # -----------------------------
+    # Hook handling
+    # -----------------------------
 
-    # ------------------------------------------------------------------
-    # Hook callbacks (fire on GPIO background thread)
-    # ------------------------------------------------------------------
+    def _handset_lifted(self):
+        # Cancels any pending short hook-drop reset
+        self.hook_check_active = False
 
-    def _on_off_hook(self):
-        """Handset lifted - cancel any pending hangup and mark as off hook."""
-        if self._hangup_timer is not None:
-            self._hangup_timer.cancel()
-            self._hangup_timer = None
-        self.off_hook = True
-        self.hangup_event.clear()
-        print("[hook] Off hook - ready to dial")
-
-    def _on_on_hook(self):
-        """Handset replaced - wait 100ms before committing the hangup."""
-        def _commit_hangup():
-            self.off_hook = False
-            self.hangup_event.set()
-            print("[hook] On hook - terminating call")
-            self._reset()
-
-        if self._hangup_timer is not None:
-            self._hangup_timer.cancel()
-        self._hangup_timer = threading.Timer(0.1, _commit_hangup)
-        self._hangup_timer.start()
-
-    # ------------------------------------------------------------------
-    # Pulse callback (fires on GPIO background thread)
-    # ------------------------------------------------------------------
-
-    def _on_pulse(self):
-        if not self.off_hook:
-            return  # ignore pulses when on hook
-        self.pulse_count += 1
-        self.last_pulse_time = time.time()
-        if self.state == IDLE:
-            self.state = DIALING
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
-    def run(self):
-        while True:
-            self._tick()
-            time.sleep(0.02)
-
-    def _tick(self):
-        now = time.time()
-
-        # Only process dialling logic when off hook
-        if not self.off_hook:
+        if self.state != "ON_HOOK":
             return
 
-        # Decode a digit once the inter-pulse gap expires
-        if self.pulse_count > 0 and (now - self.last_pulse_time > GAP_TIMEOUT):
-            digit = 0 if self.pulse_count == 12 else self.pulse_count - 1
-            self.dialled_number += str(digit)
-            self.last_digit_time = now
-            print(f"  [dial] digit={digit}  number so far={self.dialled_number}")
-            self.pulse_count = 0
+        print("\n[switchboard] Handset lifted")
+        print("[switchboard] Waiting for number...")
 
-        # Commit the number once dialling has gone quiet
-        if (
-            self.state == DIALING
-            and self.dialled_number
-            and (now - self.last_digit_time > NUMBER_TIMEOUT)
-        ):
-            self.state = PROCESSING
+        self.state = "WAITING_FOR_NUMBER"
+        self.number = ""
+        self.pulse_count = 0
+        self.last_pulse_at = None
+        self.hangup_event.clear()
 
-        # Dispatch — passes hangup_event so the handler can exit early
-        if self.state == PROCESSING:
-            print(f"\n[switchboard] Dialled: {self.dialled_number}")
-            self.state = IN_CALL
-            self.router.dispatch(self.dialled_number, self.lines, self.hangup_event)
-            self._reset()
+    def _possible_handset_down(self):
+        if self.hook_check_active:
+            return
 
-    def _reset(self):
-        self.dialled_number = ""
-        self.pulse_count    = 0
-        if self.state != IDLE:
-            self.state = IDLE
-            print("\n[switchboard] Ready.\n")
+        self.hook_check_active = True
+        threading.Thread(target=self._confirm_handset_down, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
+    def _confirm_handset_down(self):
+        time.sleep(HOOK_HANGUP_CONFIRM_SECONDS)
 
-    def _cleanup(self, sig=None, frame=None):
-        print("\n[switchboard] Shutting down...")
-        if self._hangup_timer is not None:
-            self._hangup_timer.cancel()
-        self.pulse_gpio.close()
-        self.hook_gpio.close()
-        sys.exit(0)
+        self.hook_check_active = False
+
+        # If the hook has gone high again, it was just a dial-related drop.
+        if self.hook.is_pressed:
+            print("[switchboard] Ignored brief hook drop")
+            return
+
+        self._handset_down_confirmed()
+
+    def _handset_down_confirmed(self):
+        if self.state != "ON_HOOK":
+            print("\n[switchboard] Handset down - reset")
+        else:
+            print("[switchboard] On hook")
+
+        self.hangup_event.set()
+
+        self.state = "ON_HOOK"
+        self.number = ""
+        self.pulse_count = 0
+        self.last_pulse_at = None
+
+    # -----------------------------
+    # Pulse handling
+    # -----------------------------
+
+    def _pulse_event(self):
+        if self.state not in ("WAITING_FOR_NUMBER", "DIALING"):
+            return
+
+        if self.state == "WAITING_FOR_NUMBER":
+            self.state = "DIALING"
+
+        self.pulse_count += 1
+        self.last_pulse_at = time.monotonic()
+
+        print(f"[dial] Pulse count: {self.pulse_count}")
+
+    def _finish_digit_if_ready(self):
+        if self.state != "DIALING":
+            return
+
+        if self.pulse_count <= 0 or self.last_pulse_at is None:
+            return
+
+        if time.monotonic() - self.last_pulse_at < DIGIT_GAP_SECONDS:
+            return
+
+        raw_count = self.pulse_count
+        self.pulse_count = 0
+        self.last_pulse_at = None
+
+        # Original project rule:
+        # digit = raw count - 1, except raw count 11 means 0.
+        digit = "0" if raw_count == 11 else str(raw_count - 1)
+
+        self.number += digit
+
+        print(f"[dial] Digit received: {digit} from raw pulse count {raw_count}")
+        print(f"[dial] Number so far: {self.number}")
+
+        if self.number in self.lines:
+            self._connect_number(self.number)
+
+    # -----------------------------
+    # Routing
+    # -----------------------------
+
+    def _connect_number(self, number):
+        if self.state == "CONNECTED":
+            return
+
+        line = self.lines[number]
+
+        print(f"\n[switchboard] Matched number: {number}")
+        print(f"[switchboard] Connecting to: {line.get('name', 'Unknown line')}")
+
+        self.state = "CONNECTED"
+
+        self.call_thread = threading.Thread(
+            target=self.router.connect,
+            args=(number, self.hangup_event),
+            daemon=True,
+        )
+        self.call_thread.start()
+
+    # -----------------------------
+    # Main loop
+    # -----------------------------
+
+    def run(self):
+        print("Switchboard running - restored working TTS/STT build")
+        print("No dial tone/ringback WAV layer")
+        print(f"HOOK_PIN = {HOOK_PIN}")
+        print(f"PULSE_PIN = {PULSE_PIN}")
+        print("Hook logic: HIGH = off-hook, LOW = on-hook")
+        print(f"PULSE_EDGE = {PULSE_EDGE}")
+        print(f"DIGIT_GAP_SECONDS = {DIGIT_GAP_SECONDS}")
+        print(f"HOOK_HANGUP_CONFIRM_SECONDS = {HOOK_HANGUP_CONFIRM_SECONDS}")
+
+        try:
+            while True:
+                self._finish_digit_if_ready()
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            self.hangup_event.set()
+            print("\n[switchboard] Shutting down")
 
 
 if __name__ == "__main__":
