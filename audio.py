@@ -164,9 +164,40 @@ async def _edge_tts_to_file(text: str, voice: str, out_path: Path):
 
 
 def speak_edge(text: str, voice: str = "en-IE-EmilyNeural"):
+    """
+    Edge TTS can sometimes fail with NoAudioReceived if a voice is unavailable,
+    the network hiccups, or Edge rejects a parameter.
+
+    Do not crash the call thread. Try the requested voice first, then fall back
+    to a safe UK voice, then to OpenAI TTS if available.
+    """
     out_path = Path("speech.mp3")
-    asyncio.run(_edge_tts_to_file(text, voice, out_path))
-    _play_mp3(out_path)
+    fallback_voice = "en-GB-RyanNeural"
+
+    try:
+        asyncio.run(_edge_tts_to_file(text, voice, out_path))
+        _play_mp3(out_path)
+        return
+
+    except Exception as e:
+        print(f"  [edge-tts error] Voice {voice!r} failed: {clean_text(str(e))}")
+
+    if voice != fallback_voice:
+        try:
+            print(f"  [edge-tts fallback] Trying {fallback_voice}")
+            asyncio.run(_edge_tts_to_file(text, fallback_voice, out_path))
+            _play_mp3(out_path)
+            return
+
+        except Exception as e:
+            print(f"  [edge-tts fallback error] {clean_text(str(e))}")
+
+    try:
+        print("  [tts fallback] Trying OpenAI TTS")
+        speak_openai(text, voice="alloy", model="gpt-4o-mini-tts")
+
+    except Exception as e:
+        print(f"  [tts failed] {clean_text(str(e))}")
 
 
 def speak(

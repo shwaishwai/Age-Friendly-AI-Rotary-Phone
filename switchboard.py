@@ -21,8 +21,16 @@ HOOK_ACTIVE_HIGH = True
 PULSE_EDGE = "pressed"       # change to "released" if pulse_test.py shows that is better
 PULSE_BOUNCE_SECONDS = 0.003
 
-# Time after last pulse before the digit is considered complete
-DIGIT_GAP_SECONDS = 1.00
+# Some dials send a false pulse when the dial is pulled toward a number.
+# The first edge is treated as dial movement, then pulses are ignored briefly.
+DIAL_ARM_DELAY_SECONDS = 0.15
+
+# Gap after the last valid pulse before the pulse burst is considered a complete digit.
+DIGIT_GAP_SECONDS = 0.35
+
+# Gap after a completed digit before the number is treated as complete and routed.
+# This allows multi-digit numbers such as 1191 to be entered before connecting.
+NUMBER_GAP_SECONDS = 2.0
 
 # Your hook line drops briefly while dialling, so do not reset immediately.
 # It must stay on-hook this long before we reset.
@@ -38,6 +46,12 @@ class Switchboard:
         self.number = ""
         self.pulse_count = 0
         self.last_pulse_at = None
+        self.last_digit_at = None
+        self.dial_active = False
+        self.dial_armed_at = None
+        self.last_digit_at = None
+        self.dial_active = False
+        self.dial_armed_at = None
 
         self.hangup_event = threading.Event()
         self.call_thread = None
@@ -96,6 +110,9 @@ class Switchboard:
         self.number = ""
         self.pulse_count = 0
         self.last_pulse_at = None
+        self.last_digit_at = None
+        self.dial_active = False
+        self.dial_armed_at = None
         self.hangup_event.clear()
 
     def _possible_handset_down(self):
@@ -129,20 +146,41 @@ class Switchboard:
         self.number = ""
         self.pulse_count = 0
         self.last_pulse_at = None
+        self.last_digit_at = None
+        self.dial_active = False
+        self.dial_armed_at = None
 
     # -----------------------------
     # Pulse handling
     # -----------------------------
 
     def _pulse_event(self):
-        if self.state not in ("WAITING_FOR_NUMBER", "DIALING"):
+        if self.state not in ("WAITING_FOR_NUMBER", "DIALING", "NUMBER_PENDING"):
             return
 
-        if self.state == "WAITING_FOR_NUMBER":
+        now = time.monotonic()
+
+        # If another digit begins while a number is pending, keep building it.
+        if self.state == "NUMBER_PENDING":
             self.state = "DIALING"
 
+        # First edge after rest is usually caused by pulling the dial.
+        # Do not count it as a real rotary return pulse.
+        if not self.dial_active:
+            self.dial_active = True
+            self.dial_armed_at = now + DIAL_ARM_DELAY_SECONDS
+            if self.state == "WAITING_FOR_NUMBER":
+                self.state = "DIALING"
+            print("[dial] Dial movement detected, arming...")
+            return
+
+        # Ignore any early pulse caused by pull/settling before the dial return.
+        if self.dial_armed_at is not None and now < self.dial_armed_at:
+            print("[dial] Ignored early pulse")
+            return
+
         self.pulse_count += 1
-        self.last_pulse_at = time.monotonic()
+        self.last_pulse_at = now
 
         print(f"[dial] Pulse count: {self.pulse_count}")
 
@@ -159,18 +197,42 @@ class Switchboard:
         raw_count = self.pulse_count
         self.pulse_count = 0
         self.last_pulse_at = None
+        self.dial_active = False
+        self.dial_armed_at = None
 
-        # Original project rule:
-        # digit = raw count - 1, except raw count 11 means 0.
-        digit = "0" if raw_count == 11 else str(raw_count - 1)
+        # Rotary dial rule:
+        # 1-9 pulses = digits 1-9
+        # 10 pulses = digit 0
+        digit = "0" if raw_count == 10 else str(raw_count)
 
         self.number += digit
+        self.last_digit_at = time.monotonic()
+        self.state = "NUMBER_PENDING"
 
         print(f"[dial] Digit received: {digit} from raw pulse count {raw_count}")
         print(f"[dial] Number so far: {self.number}")
+        print(f"[dial] Waiting {NUMBER_GAP_SECONDS}s for another digit...")
 
-        if self.number in self.lines:
-            self._connect_number(self.number)
+    def _connect_number_if_ready(self):
+        if self.state != "NUMBER_PENDING":
+            return
+
+        if not self.number or self.last_digit_at is None:
+            return
+
+        if time.monotonic() - self.last_digit_at < NUMBER_GAP_SECONDS:
+            return
+
+        number = self.number
+
+        if number in self.lines:
+            self._connect_number(number)
+        else:
+            print(f"[switchboard] No line configured for number: {number}")
+            print("[switchboard] Waiting for number...")
+            self.number = ""
+            self.last_digit_at = None
+            self.state = "WAITING_FOR_NUMBER"
 
     # -----------------------------
     # Routing
@@ -194,23 +256,47 @@ class Switchboard:
         )
         self.call_thread.start()
 
+
+    def _print_available_lines(self):
+        print("\nAvailable lines:")
+        print("-" * 72)
+
+        for number, config in sorted(self.lines.items(), key=lambda item: item[0]):
+            name = config.get("name", "Unknown")
+            line_type = config.get("type", "unknown")
+            voice = config.get("voice", "n/a")
+            tts_engine = config.get("tts_engine", "n/a")
+            handler = config.get("handler", "")
+
+            extra = ""
+            if handler:
+                extra = f" | handler={handler}"
+
+            print(f"{number:<6} -> {name} ({line_type}) | voice={voice} | tts={tts_engine}{extra}")
+
+        print("-" * 72)
+
     # -----------------------------
     # Main loop
     # -----------------------------
 
     def run(self):
         print("Switchboard running - restored working TTS/STT build")
+        self._print_available_lines()
         print("No dial tone/ringback WAV layer")
         print(f"HOOK_PIN = {HOOK_PIN}")
         print(f"PULSE_PIN = {PULSE_PIN}")
         print("Hook logic: HIGH = off-hook, LOW = on-hook")
         print(f"PULSE_EDGE = {PULSE_EDGE}")
+        print(f"DIAL_ARM_DELAY_SECONDS = {DIAL_ARM_DELAY_SECONDS}")
         print(f"DIGIT_GAP_SECONDS = {DIGIT_GAP_SECONDS}")
+        print(f"NUMBER_GAP_SECONDS = {NUMBER_GAP_SECONDS}")
         print(f"HOOK_HANGUP_CONFIRM_SECONDS = {HOOK_HANGUP_CONFIRM_SECONDS}")
 
         try:
             while True:
                 self._finish_digit_if_ready()
+                self._connect_number_if_ready()
                 time.sleep(0.01)
         except KeyboardInterrupt:
             self.hangup_event.set()
