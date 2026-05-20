@@ -1,49 +1,47 @@
 import json
 import threading
 import time
+import random
 from pathlib import Path
 
 from gpiozero import Button
 
 from router import Router
+from telephony import (
+    preload_sounds,
+    start_dial_tone,
+    stop_dial_tone,
+    start_ringback,
+    stop_ringback,
+    play_pulse_click,
+    play_pickup,
+    play_hangup,
+    stop_all_telephony_sounds,
+)
 
 
 # Correct pins for your current wiring
 PULSE_PIN = 27
 HOOK_PIN = 22
 
-# Current hook logic:
 # HIGH = off-hook / handset lifted
 # LOW  = on-hook / handset down
 HOOK_ACTIVE_HIGH = True
 
-# Rotary dial pulse settings
-PULSE_EDGE = "pressed"       # change to "released" if pulse_test.py shows that is better
+PULSE_EDGE = "pressed"
 PULSE_BOUNCE_SECONDS = 0.003
 
-# Some dials send a false pulse when the dial is pulled toward a number.
-# The first edge is treated as dial movement, then pulses are ignored briefly.
 DIAL_ARM_DELAY_SECONDS = 0.15
-
-# Gap after the last valid pulse before the pulse burst is considered a complete digit.
-# Keep this comfortably longer than the biggest gap between pulses on a slow rotary return.
 DIGIT_GAP_SECONDS = 0.5
-
-# Gap after a completed digit before the number is treated as complete and routed.
-# This allows multi-digit numbers such as 1191 to be entered before connecting.
 NUMBER_GAP_SECONDS = 2.5
-
-# While rotary pulses are active, ignore hook checks.
-# This prevents dial-related hook drops from resetting the switchboard mid-digit.
 HOOK_IGNORE_AFTER_PULSE_SECONDS = 0.75
-
-# Your hook line drops briefly while dialling, so do not reset immediately.
-# It must stay on-hook this long before we reset.
 HOOK_HANGUP_CONFIRM_SECONDS = 0.60
 
 
 class Switchboard:
     def __init__(self, lines_path="lines.json"):
+        preload_sounds()
+
         self.lines = self._load_lines(lines_path)
         self.router = Router(self.lines)
 
@@ -55,24 +53,18 @@ class Switchboard:
         self.last_dial_activity_at = None
         self.dial_active = False
         self.dial_armed_at = None
-        self.last_digit_at = None
-        self.last_dial_activity_at = None
-        self.dial_active = False
-        self.dial_armed_at = None
         self.lock = threading.Lock()
 
         self.hangup_event = threading.Event()
         self.call_thread = None
         self.hook_check_active = False
 
-        # Hook: HIGH = off-hook, LOW = on-hook
         self.hook = Button(
             HOOK_PIN,
             pull_up=False,
             bounce_time=0.03,
         )
 
-        # Pulse: impulse contacts between GPIO 27 and GND
         self.pulse = Button(
             PULSE_PIN,
             pull_up=True,
@@ -89,7 +81,6 @@ class Switchboard:
         else:
             raise ValueError('PULSE_EDGE must be "pressed" or "released"')
 
-        # Start in the actual physical state
         if self.hook.is_pressed:
             self._handset_lifted()
         else:
@@ -101,13 +92,6 @@ class Switchboard:
             return json.load(f)
 
     def _dial_activity_in_progress(self):
-        """
-        Return True while the rotary dial is actively being used.
-
-        This is deliberately a little generous: hook contacts can wobble while
-        the dial is being pulled or returning, so hook checks are ignored during
-        active dialing and briefly after the most recent dial activity.
-        """
         now = time.monotonic()
 
         with self.lock:
@@ -133,13 +117,16 @@ class Switchboard:
     # -----------------------------
 
     def _handset_lifted(self):
-        # Cancels any pending short hook-drop reset
         self.hook_check_active = False
 
         if self.state != "ON_HOOK":
             return
 
         print("\n[switchboard] Handset lifted")
+
+        # Physical receiver pickup sound
+        play_pickup()
+
         print("[switchboard] Waiting for number...")
 
         self.state = "WAITING_FOR_NUMBER"
@@ -151,6 +138,9 @@ class Switchboard:
         self.dial_active = False
         self.dial_armed_at = None
         self.hangup_event.clear()
+
+        # Start dial tone after receiver is lifted
+        start_dial_tone()
 
     def _possible_handset_down(self):
         if self._dial_activity_in_progress():
@@ -168,12 +158,10 @@ class Switchboard:
 
         self.hook_check_active = False
 
-        # If rotary pulses are active, this hook drop is dial-related.
         if self._dial_activity_in_progress():
             print("[switchboard] Ignored hook drop because dialing is active")
             return
 
-        # If the hook has gone high again, it was just a brief hook drop.
         if self.hook.is_pressed:
             print("[switchboard] Ignored brief hook drop")
             return
@@ -181,8 +169,11 @@ class Switchboard:
         self._handset_down_confirmed()
 
     def _handset_down_confirmed(self):
+        stop_all_telephony_sounds()
+
         if self.state != "ON_HOOK":
             print("\n[switchboard] Handset down - reset")
+            play_hangup()
         else:
             print("[switchboard] On hook")
 
@@ -209,21 +200,22 @@ class Switchboard:
             now = time.monotonic()
             self.last_dial_activity_at = now
 
-            # If another digit starts while a number is pending, continue building it.
             if self.state == "NUMBER_PENDING":
                 self.state = "DIALING"
 
-            # First edge after rest is usually caused by pulling the dial.
-            # Do not count it as a real rotary return pulse.
             if not self.dial_active:
                 self.dial_active = True
                 self.dial_armed_at = now + DIAL_ARM_DELAY_SECONDS
+
                 if self.state == "WAITING_FOR_NUMBER":
                     self.state = "DIALING"
+
                 print("[dial] Dial movement detected, arming...")
+
+                # Stop dial tone as soon as the caller begins dialing
+                stop_dial_tone()
                 return
 
-            # Ignore any early pulse caused by pull/settling before the dial return.
             if self.dial_armed_at is not None and now < self.dial_armed_at:
                 print("[dial] Ignored early pulse")
                 return
@@ -231,6 +223,9 @@ class Switchboard:
             self.pulse_count += 1
             self.last_pulse_at = now
             self.last_dial_activity_at = now
+
+            # Low-latency mechanical click per accepted pulse
+            play_pulse_click()
 
             print(f"[dial] Pulse count: {self.pulse_count}")
 
@@ -252,9 +247,6 @@ class Switchboard:
             self.dial_active = False
             self.dial_armed_at = None
 
-            # Rotary dial rule:
-            # 1-9 pulses = digits 1-9
-            # 10 pulses = digit 0
             digit = "0" if raw_count == 10 else str(raw_count)
 
             self.number += digit
@@ -287,9 +279,11 @@ class Switchboard:
                 self.number = ""
                 self.last_digit_at = None
                 self.state = "WAITING_FOR_NUMBER"
+
+                # Return to dial tone for another attempt
+                start_dial_tone()
                 return
 
-        # Connect outside the lock because this starts the call thread.
         self._connect_number(number)
 
     # -----------------------------
@@ -307,13 +301,24 @@ class Switchboard:
 
         self.state = "CONNECTED"
 
+        def connect_with_ringback():
+            start_ringback()
+            time.sleep(random.uniform(2.0, 5.0))
+            stop_ringback()
+
+            if self.hangup_event.is_set():
+                return
+
+            # “Answered” sound before the handler begins
+            play_pickup()
+
+            self.router.connect(number, self.hangup_event)
+
         self.call_thread = threading.Thread(
-            target=self.router.connect,
-            args=(number, self.hangup_event),
+            target=connect_with_ringback,
             daemon=True,
         )
         self.call_thread.start()
-
 
     def _print_available_lines(self):
         print("\nAvailable lines:")
@@ -330,7 +335,10 @@ class Switchboard:
             if handler:
                 extra = f" | handler={handler}"
 
-            print(f"{number:<6} -> {name} ({line_type}) | voice={voice} | tts={tts_engine}{extra}")
+            print(
+                f"{number:<6} -> {name} ({line_type}) "
+                f"| voice={voice} | tts={tts_engine}{extra}"
+            )
 
         print("-" * 72)
 
@@ -339,9 +347,9 @@ class Switchboard:
     # -----------------------------
 
     def run(self):
-        print("Switchboard running - restored working TTS/STT build")
+        print("Switchboard running - telephony sound build")
         self._print_available_lines()
-        print("No dial tone/ringback WAV layer")
+        print("Dial tone / ringback / pulse click / pickup / hangup enabled")
         print(f"HOOK_PIN = {HOOK_PIN}")
         print(f"PULSE_PIN = {PULSE_PIN}")
         print("Hook logic: HIGH = off-hook, LOW = on-hook")
@@ -359,6 +367,7 @@ class Switchboard:
                 time.sleep(0.01)
         except KeyboardInterrupt:
             self.hangup_event.set()
+            stop_all_telephony_sounds()
             print("\n[switchboard] Shutting down")
 
 
