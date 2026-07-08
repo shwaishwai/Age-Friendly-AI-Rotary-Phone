@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import scipy.io.wavfile as wav
+import scipy.signal as signal
 import sounddevice as sd
 import whisper
 
@@ -22,11 +23,31 @@ try:
 except Exception:
     pass
 
-SAMPLE_RATE = 16000
+# The USB microphone records reliably at 48000 Hz.
+# Whisper expects 16000 Hz audio, so we resample before transcription.
+RECORD_SAMPLE_RATE = 48000
+WHISPER_SAMPLE_RATE = 16000
+SAMPLE_RATE = RECORD_SAMPLE_RATE
 FRAME_DURATION = 30
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)
 SILENCE_TIMEOUT = 1.2
 VAD_AGGRESSIVENESS = 2
+
+# USB microphone device number from sounddevice.query_devices()
+# Set to None to use the system default.
+MIC_DEVICE = 1
+
+# Your USB audio device reports 2 input channels.
+# We record both and convert them to mono so the correct mic channel is not missed.
+MIC_CHANNELS = 2
+
+# Level-based speech detection.
+# From your test, background RMS was often around 25-60 and speech/noise spikes were much higher.
+# Raise MIC_START_RMS if it triggers too easily. Lower it if it misses your voice.
+MIC_START_RMS = 120
+MIC_CONTINUE_RMS = 80
+MIC_MAX_UTTERANCE_SECONDS = 8
+MIC_LEVEL_DEBUG = True
 
 _whisper_model = None
 _tts_client = None
@@ -70,18 +91,31 @@ def get_tts_client():
 
 def record_until_silence(hangup_event: threading.Event, max_duration: int = 30) -> np.ndarray | None:
     print("  [mic] Listening...")
+    print(f"  [mic] Using input device {MIC_DEVICE}:")
+    print(sd.query_devices(MIC_DEVICE))
 
     frames_per_second = 1000 // FRAME_DURATION
     silence_frames_needed = int(SILENCE_TIMEOUT * frames_per_second)
     max_frames = max_duration * frames_per_second
+    max_utterance_frames = int(MIC_MAX_UTTERANCE_SECONDS * frames_per_second)
 
     audio_buffer = []
+    pre_roll = []
     silence_count = 0
     speech_started = False
+    speech_frames = 0
+
+    # Keep a small amount of audio from just before speech starts,
+    # so the first word is not clipped.
+    pre_roll_frames = int(0.30 * frames_per_second)
+
+    level_print_interval = frames_per_second
+    frames_seen = 0
 
     with sd.RawInputStream(
+        device=MIC_DEVICE,
         samplerate=SAMPLE_RATE,
-        channels=1,
+        channels=MIC_CHANNELS,
         dtype="int16",
         blocksize=FRAME_SIZE
     ) as stream:
@@ -90,35 +124,103 @@ def record_until_silence(hangup_event: threading.Event, max_duration: int = 30) 
                 return None
 
             raw, _ = stream.read(FRAME_SIZE)
-            frame = bytes(raw)
-            is_speech = _vad.is_speech(frame, SAMPLE_RATE)
+            samples = np.frombuffer(bytes(raw), dtype=np.int16)
 
-            if is_speech:
-                if not speech_started:
-                    print("  [mic] Speech detected")
+            if MIC_CHANNELS > 1:
+                samples = samples.reshape(-1, MIC_CHANNELS)
+                channel_rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2, axis=0))
+                best_channel = int(np.argmax(channel_rms))
+                mono = samples[:, best_channel].astype(np.int16)
+            else:
+                mono = samples.astype(np.int16)
+
+            peak = int(np.max(np.abs(mono))) if mono.size else 0
+            rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2))) if mono.size else 0.0
+
+            frames_seen += 1
+            if MIC_LEVEL_DEBUG and frames_seen % level_print_interval == 0:
+                status = "speech" if speech_started else "waiting"
+                print(f"  [mic] Level peak={peak}, rms={rms:.1f}, status={status}")
+
+            if not speech_started:
+                pre_roll.append(mono.copy())
+                if len(pre_roll) > pre_roll_frames:
+                    pre_roll.pop(0)
+
+                # Start recording when the RMS level rises above the speech threshold.
+                if rms >= MIC_START_RMS:
+                    print(f"  [mic] Speech detected, peak={peak}, rms={rms:.1f}")
                     speech_started = True
-                silence_count = 0
-                audio_buffer.append(np.frombuffer(frame, dtype=np.int16))
+                    audio_buffer.extend(pre_roll)
+                    pre_roll.clear()
+                    audio_buffer.append(mono.copy())
+                    speech_frames = 1
 
-            elif speech_started:
-                audio_buffer.append(np.frombuffer(frame, dtype=np.int16))
+                continue
+
+            # Speech has started. Keep recording.
+            audio_buffer.append(mono.copy())
+            speech_frames += 1
+
+            # Stop if the user has been talking/noisy for too long.
+            # This prevents the call from getting stuck listening forever.
+            if speech_frames >= max_utterance_frames:
+                print("  [mic] Max utterance length reached -- processing audio")
+                break
+
+            # End once the level has stayed low long enough.
+            if rms < MIC_CONTINUE_RMS:
                 silence_count += 1
                 if silence_count >= silence_frames_needed:
                     print("  [mic] Silence detected -- end of utterance")
                     break
+            else:
+                silence_count = 0
 
     if not audio_buffer:
+        print("  [mic] No speech captured")
         return None
 
     return np.concatenate(audio_buffer)
 
 
+def resample_for_whisper(audio: np.ndarray) -> np.ndarray:
+    """
+    The USB mic records at 48000 Hz, but Whisper expects 16000 Hz.
+    Convert before transcription so speech is not interpreted at the wrong speed.
+    """
+    if RECORD_SAMPLE_RATE == WHISPER_SAMPLE_RATE:
+        return audio.astype(np.int16)
+
+    audio_float = audio.astype(np.float32)
+    resampled = signal.resample_poly(audio_float, WHISPER_SAMPLE_RATE, RECORD_SAMPLE_RATE)
+    resampled = np.clip(resampled, -32768, 32767)
+    return resampled.astype(np.int16)
+
+
 def save_audio(audio: np.ndarray, filename: str = "temp.wav"):
-    wav.write(filename, SAMPLE_RATE, audio)
+    # Save the version Whisper will actually hear.
+    audio_16k = resample_for_whisper(audio)
+    wav.write(filename, WHISPER_SAMPLE_RATE, audio_16k)
 
 
 def transcribe_audio(audio: np.ndarray, language: str | None = None, prompt: str | None = None) -> str:
-    audio_float = audio.astype(np.float32) / 32768.0
+    # Convert 48 kHz mic audio to 16 kHz before giving it to Whisper.
+    audio_16k = resample_for_whisper(audio)
+    audio_float = audio_16k.astype(np.float32) / 32768.0
+
+    # Helpful debug file. You can play this after a failed call:
+    #   aplay last_caller_audio.wav
+    try:
+        wav.write("last_caller_audio.wav", WHISPER_SAMPLE_RATE, audio_16k)
+        print("  [stt] Saved captured audio to last_caller_audio.wav")
+    except Exception as e:
+        print(f"  [stt] Could not save debug audio: {clean_text(str(e))}")
+
+    duration = len(audio_16k) / WHISPER_SAMPLE_RATE if len(audio_16k) else 0
+    peak = int(np.max(np.abs(audio_16k))) if len(audio_16k) else 0
+    rms = float(np.sqrt(np.mean(audio_16k.astype(np.float32) ** 2))) if len(audio_16k) else 0.0
+    print(f"  [stt] Audio for Whisper: {duration:.2f}s, peak={peak}, rms={rms:.1f}")
 
     kwargs = {"fp16": False}
     if language:
